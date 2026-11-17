@@ -1,6 +1,7 @@
 package main
 
 import (
+	"mime"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -107,6 +109,15 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// TouchChat moves a chat's last message time forward without renaming it
+func (store *MessageStore) TouchChat(jid string, t time.Time) {
+	_, _ = store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, '', ?)
+		ON CONFLICT(jid) DO UPDATE SET last_message_time = MAX(last_message_time, excluded.last_message_time)`,
+		jid, t,
+	)
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -203,7 +214,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, store *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -279,7 +290,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// Real type from the extension (application/pdf, ...): octet-stream arrives as an unopenable file
+			mimeType = mime.TypeByExtension("." + fileExt)
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -347,6 +362,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
 				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				FileName:      proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -362,10 +378,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// WhatsApp does not echo our own sends back, so store them here:
+	// readers of messages.db (MCP server, Social Desk) must see what was sent.
+	if store != nil {
+		content := message
+		if content == "" && mediaPath != "" {
+			content = "[file] " + filepath.Base(mediaPath)
+		}
+		sender := ""
+		if client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+		chatJID := recipientJID.String()
+		if err := store.StoreMessage(resp.ID, chatJID, sender, content, resp.Timestamp, true,
+			"", "", "", nil, nil, nil, 0); err != nil {
+			fmt.Printf("Sent, but failed to store the sent message: %v\n", err)
+		}
+		store.TouchChat(chatJID, resp.Timestamp)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -463,9 +498,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s]\n", timestamp, direction, sender, mediaType) // no message text in logs
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: (%d chars)\n", timestamp, direction, sender, len(content)) // no message text in logs
 		}
 	}
 }
@@ -591,7 +626,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = fmt.Sprintf("%s/%s", chatDir, filepath.Base(filename)) // sender controls filename: strip any ../ path
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -667,13 +702,33 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
+	// Keep the query (oh=, oe=, ...): it is the signature, without it WhatsApp answers 403
+	return "/" + parts[1]
+}
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+// localOnly blocks requests from web pages: a browser can only send
+// "application/json" cross-origin after a CORS preflight, which this server
+// never approves, and a Host check stops DNS-rebinding tricks.
+func localOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if host != "localhost" && host != "127.0.0.1" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Origin") != "" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -704,10 +759,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Println("Received request to send message to", req.Recipient)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -725,6 +780,55 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
+	// Handler for reactions: put (or with an empty emoji, remove) a reaction on a message
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID   string `json:"chat_jid"`
+			MessageID string `json:"message_id"`
+			Sender    string `json:"sender"` // full JID of the message's author; ignored when from_me
+			FromMe    bool   `json:"from_me"`
+			Emoji     string `json:"emoji"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		reply := func(ok bool, msg string) {
+			if !ok {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: ok, Message: msg})
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			reply(false, fmt.Sprintf("bad chat_jid: %v", err))
+			return
+		}
+		var sender types.JID
+		if req.FromMe {
+			if client.Store.ID == nil {
+				reply(false, "not logged in")
+				return
+			}
+			sender = client.Store.ID.ToNonAD()
+		} else if sender, err = types.ParseJID(req.Sender); err != nil || req.Sender == "" {
+			reply(false, "sender (full JID) is required for messages from others")
+			return
+		}
+		msg := client.BuildReaction(chat, sender, req.MessageID, req.Emoji)
+		if _, err := client.SendMessage(context.Background(), chat, msg); err != nil {
+			reply(false, fmt.Sprintf("Error sending reaction: %v", err))
+			return
+		}
+		fmt.Println("Reaction sent in", req.ChatJID)
+		reply(true, "Reaction sent")
+	})
+
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
@@ -775,13 +879,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server on localhost only: the API has no authentication
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, localOnly(http.DefaultServeMux)); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -789,11 +893,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 func main() {
 	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	// WARN by default: INFO logs every message text. Set WA_LOG_LEVEL=INFO to debug.
+	logLevel := os.Getenv("WA_LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "WARN"
+	}
+	logger := waLog.Stdout("Client", logLevel, true)
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := waLog.Stdout("Database", logLevel, true)
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -873,7 +982,10 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Also save the raw code so it can be rendered as an image
+				_ = os.WriteFile("store/qr.txt", []byte(evt.Code), 0600)
 			} else if evt.Event == "success" {
+				_ = os.Remove("store/qr.txt")
 				connected <- true
 				break
 			}
@@ -975,7 +1087,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
