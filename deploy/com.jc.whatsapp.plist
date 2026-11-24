@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jc.whatsapp</string>
+    <!-- WhatsApp bridge, API on 127.0.0.1:8080. Filled in by deploy/install.sh. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__RUNTIME__/whatsapp-bridge</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__RUNTIME__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart if it crashes; wait 30 s between restarts -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>__RUNTIME__/state/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>__RUNTIME__/state/bridge.log</string>
+</dict>
+</plist>
